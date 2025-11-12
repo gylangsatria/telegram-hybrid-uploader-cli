@@ -1,0 +1,21 @@
+from telethon.sync import TelegramClient
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+api_id = int(os.getenv("API_ID"))
+api_hash = os.getenv("API_HASH")
+group_target = os.getenv("GROUP_TARGET")
+
+client = TelegramClient('session', api_id, api_hash)
+
+def upload_folder(folder_path):
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            full_path = os.path.join(root, file)
+            print(f"Uploading: {full_path}")
+            client.send_file(group_target, full_path)
+
+with client:
+    upload_folder("./media")
