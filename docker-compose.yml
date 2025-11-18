@@ -7,4 +7,11 @@ services:
       - .env
     volumes:
       - "/media/gylang/My Book/Backup/telegram_uploader.py/media:/media:ro"
+    develop:
+      watch:
+        - path: .
+          action: sync
+          target: /app
+        - path: requirements.txt
+          action: rebuild
 
