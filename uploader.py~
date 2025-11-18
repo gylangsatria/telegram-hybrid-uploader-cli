@@ -4,6 +4,7 @@ import asyncio
 from dotenv import load_dotenv
 from tqdm import tqdm
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from telethon import TelegramClient
 
 # Load environment
@@ -12,6 +13,7 @@ api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
 bot_token = os.getenv("BOT_TOKEN")
 group_target = int(os.getenv("GROUP_TARGET"))
+upload_mode = os.getenv("UPLOAD_MODE", "telethon").lower()
 
 # Init Telethon client
 client = TelegramClient('bot', api_id=api_id, api_hash=api_hash)
@@ -19,33 +21,54 @@ client = TelegramClient('bot', api_id=api_id, api_hash=api_hash)
 async def start_client():
     await client.start(bot_token=bot_token)
 
-# Upload via Bot API (≤50 MB)
-def upload_bot_api(full_path):
-    with open(full_path, 'rb') as f:
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendDocument",
-            data={'chat_id': group_target},
-            files={'document': f},
-            timeout=120
-        )
-    return response.status_code == 200, response.text
+# Session dengan retry untuk Bot API
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# Upload via Telethon (>50 MB)
-async def upload_telethon(full_path):
+# Upload via Bot API
+def upload_bot_api(full_path):
     try:
-        await client.send_file(
-            group_target,
-            full_path,
-            part_size_kb=2048,   # 2 MB chunk
-            use_cache=False
-        )
-        return True, "sent via Telethon"
+        with open(full_path, 'rb') as f:
+            response = session.post(
+                f"https://api.telegram.org/bot{bot_token}/sendDocument",
+                data={'chat_id': group_target},
+                files={'document': f},
+                timeout=300
+            )
+        return response.status_code == 200, response.text
     except Exception as e:
         return False, str(e)
 
+# Upload via Telethon
+async def upload_telethon(full_path, semaphore):
+    async with semaphore:
+        try:
+            start = time.time()
+            await client.send_file(
+                group_target,
+                full_path,
+                part_size_kb=4096,   # 4 MB chunk
+                use_cache=False
+            )
+            end = time.time()
+            elapsed = end - start
+            size_bytes = os.path.getsize(full_path)
+            size_mb = size_bytes / (1024 * 1024)
+            kbps = (size_bytes * 8) / 1024 / elapsed if elapsed > 0 else 0
+            print(f"Uploaded: {os.path.basename(full_path)} — {size_mb:.2f} MB in {elapsed:.2f}s (~{kbps:.2f} kbps)")
+            with open("upload.log", "a") as log:
+                log.write(f"{full_path} | {size_mb:.2f} MB | {elapsed:.2f}s | {kbps:.2f} kbps | Telethon\n")
+            return True
+        except Exception as e:
+            print(f"Failed: {os.path.basename(full_path)} — {e}")
+            with open("error.log", "a") as err:
+                err.write(f"{full_path} — {e}\n")
+            return False
+
 # Hybrid uploader
-async def upload_folder(folder_path, batch_size=5):
-    print(f"Starting hybrid upload from: {folder_path}")
+async def upload_folder(folder_path, concurrency=10):
+    print(f"Starting upload from: {folder_path} (mode={upload_mode})")
     
     all_files = []
     for root, dirs, files in os.walk(folder_path):
@@ -53,55 +76,36 @@ async def upload_folder(folder_path, batch_size=5):
             full_path = os.path.join(root, file)
             all_files.append(full_path)
 
-    # Loop files with tqdm
-    for i in tqdm(range(0, len(all_files), batch_size), desc="Uploading files", unit="batch"):
-        batch = all_files[i:i+batch_size]
-        tasks = []
-        for full_path in batch:
-            size_bytes = os.path.getsize(full_path)
-            size_mb = size_bytes / (1024 * 1024)
-            start = time.time()
+    semaphore = asyncio.Semaphore(concurrency)
 
-            if size_mb <= 50:
-                success, info = upload_bot_api(full_path)
-                method = "Bot API"
-                end = time.time()
-                elapsed = end - start
-                kbps = (size_bytes * 8) / 1024 / elapsed if elapsed > 0 else 0
-                if success:
-                    print(f"Uploaded: {os.path.basename(full_path)} via {method} — {size_mb:.2f} MB in {elapsed:.2f}s (~{kbps:.2f} kbps)")
-                    with open("upload.log", "a") as log:
-                        log.write(f"{full_path} | {size_mb:.2f} MB | {elapsed:.2f}s | {kbps:.2f} kbps | {method}\n")
-                else:
-                    print(f"Failed: {os.path.basename(full_path)} — {info}")
-                    with open("error.log", "a") as err:
-                        err.write(f"{full_path} — {info}\n")
+    for full_path in tqdm(all_files, desc="Uploading files", unit="file"):
+        size_bytes = os.path.getsize(full_path)
+        size_mb = size_bytes / (1024 * 1024)
+        start = time.time()
+
+        if upload_mode == "hybrid" and size_mb <= 50:
+            success, info = upload_bot_api(full_path)
+            method = "Bot API"
+            end = time.time()
+            elapsed = end - start
+            kbps = (size_bytes * 8) / 1024 / elapsed if elapsed > 0 else 0
+            if success:
+                print(f"Uploaded: {os.path.basename(full_path)} via {method} — {size_mb:.2f} MB in {elapsed:.2f}s (~{kbps:.2f} kbps)")
+                with open("upload.log", "a") as log:
+                    log.write(f"{full_path} | {size_mb:.2f} MB | {elapsed:.2f}s | {kbps:.2f} kbps | {method}\n")
             else:
-                tasks.append(upload_telethon(full_path))
+                print(f"Failed: {os.path.basename(full_path)} — {info}")
+                with open("error.log", "a") as err:
+                    err.write(f"{full_path} — {info}\n")
+        else:
+            await upload_telethon(full_path, semaphore)
 
-        # Jalankan batch Telethon paralel
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for idx, res in enumerate(results):
-                full_path = batch[idx]
-                size_bytes = os.path.getsize(full_path)
-                size_mb = size_bytes / (1024 * 1024)
-                if isinstance(res, tuple) and res[0]:
-                    print(f"Uploaded: {os.path.basename(full_path)} via Telethon — {size_mb:.2f} MB")
-                    with open("upload.log", "a") as log:
-                        log.write(f"{full_path} | {size_mb:.2f} MB | Telethon\n")
-                else:
-                    print(f"Failed: {os.path.basename(full_path)} — {res}")
-                    with open("error.log", "a") as err:
-                        err.write(f"{full_path} — {res}\n")
-
-        # Delay antar batch biar aman
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
 
 # Main runner
 async def main():
     await start_client()
-    await upload_folder("/media", batch_size=5)
+    await upload_folder("/media", concurrency=10)
     await client.disconnect()
 
 if __name__ == "__main__":
