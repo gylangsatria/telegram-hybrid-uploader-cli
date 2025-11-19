@@ -2,4 +2,3 @@ telethon
 python-dotenv
 tqdm
 requests
-requests_toolbelt

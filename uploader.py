@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 import requests
 from requests.adapters import HTTPAdapter, Retry
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from telethon import TelegramClient
 
 # Load environment
@@ -41,19 +42,19 @@ def upload_bot_api(full_path):
     try:
         size_bytes = os.path.getsize(full_path)
         with open(full_path, 'rb') as f:
+            encoder = MultipartEncoder(
+                fields={'chat_id': str(group_target),
+                        'document': (os.path.basename(full_path), f)}
+            )
             with tqdm(total=size_bytes, unit='B', unit_scale=True, desc=os.path.basename(full_path)) as pbar:
-                def file_iter():
-                    while True:
-                        chunk = f.read(1024 * 64)  # 64 KB
-                        if not chunk:
-                            break
-                        pbar.update(len(chunk))
-                        yield chunk
+                def callback(monitor):
+                    pbar.update(monitor.bytes_read - pbar.n)
 
+                monitor = MultipartEncoderMonitor(encoder, callback)
                 response = session.post(
                     f"https://api.telegram.org/bot{bot_token}/sendDocument",
-                    data={'chat_id': group_target},
-                    files={'document': ('file', file_iter())},
+                    data=monitor,
+                    headers={'Content-Type': monitor.content_type},
                     timeout=300
                 )
         return response.status_code == 200, response.text
@@ -67,8 +68,7 @@ async def upload_telethon(full_path, semaphore):
             size_bytes = os.path.getsize(full_path)
             with tqdm(total=size_bytes, unit='B', unit_scale=True, desc=os.path.basename(full_path)) as pbar:
                 def progress_callback(sent, total):
-                    pbar.n = sent
-                    pbar.refresh()
+                    pbar.update(sent - pbar.n)
 
                 await client.send_file(
                     group_target,
